@@ -193,9 +193,7 @@ body{font-family:'Noto Sans',sans-serif;background:var(--bg);color:var(--txt);mi
 ::-webkit-scrollbar-thumb{background:var(--brd2);}
 </style>
 
-<!-- Firebase SDKs -->
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<!-- Firebase via REST API - no SDK needed -->
 <style>
 #fbLoading{position:fixed;inset:0;background:#0b1209ee;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;}
 .fb-spin{width:40px;height:40px;border:3px solid var(--brd);border-top-color:var(--gold);border-radius:50%;animation:spin 0.8s linear infinite;}
@@ -207,7 +205,7 @@ body{font-family:'Noto Sans',sans-serif;background:var(--bg);color:var(--txt);mi
 <div id="fbLoading"><div class="fb-spin"></div><div class="fb-txt">ЗАВАНТАЖЕННЯ ДАНИХ...</div></div>
 
 <!-- ══ КРОК 1: ПАРОЛЬ ══ -->
-<div class="screen on" id="s-login">
+<div class="screen" id="s-login">
   <div class="logo">⭐</div>
   <div class="ltitle">416 Група</div>
   <div class="lsub">ЖУРНАЛ УСПІШНОСТІ</div>
@@ -398,90 +396,76 @@ function dk(d){return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0'
 function wk(d){const t=new Date(d);t.setHours(0,0,0,0);t.setDate(t.getDate()-((t.getDay()+6)%7));return dk(t);}
 function wDays(w){const a=[];const dt=new Date(w);for(let i=0;i<7;i++){const d=new Date(dt);d.setDate(d.getDate()+i);a.push(dk(d));}return a;}
 
-// ══════════ FIREBASE CONFIG ══════════
-// 🔴 ЗАМІНІТЬ ЦЕ СВОЇМ КОНФІГОМ З FIREBASE CONSOLE:
-const FB_CONFIG = {
-  apiKey: "AIzaSyC7OJCgEtABauM49_xsgF-xvi9HkVoEysw",
-  authDomain: "zhurnal-fd41a.firebaseapp.com",
-  databaseURL: "https://zhurnal-fd41a-default-rtdb.firebaseio.com",
-  projectId: "zhurnal-fd41a",
-  storageBucket: "zhurnal-fd41a.firebasestorage.app",
-  messagingSenderId: "676864076537",
-  appId: "1:676864076537:web:1fe0c9b48c01f9d4b65028",
-  measurementId: "G-PV9CNFNY2X"
-};
-
-let db = null;
+// ══════════ FIREBASE REST API ══════════
+const FB_DB_URL = "https://zhurnal-fd41a-default-rtdb.firebaseio.com";
 let dbReady = false;
+let _svTimer = null;
+let _pollTimer = null;
+let _lastSaveTime = 0;
 
-function initFirebase() {
-  try {
-    if (!firebase.apps || !firebase.apps.length) {
-      firebase.initializeApp(FB_CONFIG);
-    }
-    db = firebase.database();
-    dbReady = true;
-    ld();
-  } catch(e) {
-    console.error('Firebase init error:', e);
-    toast('⚠️ Firebase не підключено! Перевір конфіг.');
-    // Fallback to localStorage
-    ldLocal();
-  }
+async function fbGet(path) {
+  const r = await fetch(FB_DB_URL + path + '.json');
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
 }
 
-function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('on'));document.getElementById(id).classList.add('on');}
+async function fbSet(path, data) {
+  const r = await fetch(FB_DB_URL + path + '.json', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data)
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+function initFirebase() {
+  console.log('[Firebase] Init via REST API...');
+  dbReady = true;
+  ld();
+}
 
 function showLoading(on) {
-  let el = document.getElementById('fbLoading');
-  if (!el) return;
-  el.style.display = on ? 'flex' : 'none';
+  const el = document.getElementById('fbLoading');
+  if (el) el.style.display = on ? 'flex' : 'none';
 }
 
 // ══════════ LOAD / SAVE ══════════
 function ld() {
-  if (!dbReady) { ldLocal(); return; }
   showLoading(true);
-  db.ref('j416/state').once('value').then(snap => {
-    const p = snap.val();
+  fbGet('/j416/state').then(p => {
     if (p && p.cadets && p.cadets.length) {
       S = p;
     } else {
-      // First launch — push initial state
       svRemote();
     }
     showLoading(false);
-    // Listen for real-time changes from other users
-    startListening();
+    show('s-login');
+    startPolling();
   }).catch(e => {
-    console.error('Firebase load error:', e);
+    console.error('[Firebase] Load error:', e);
     showLoading(false);
     ldLocal();
-    toast('⚠️ Немає з\'єднання. Дані локальні.');
+    show('s-login');
+    setTimeout(() => toast('⚠️ Хмара недоступна. Дані локальні.'), 300);
   });
 }
 
 function ldLocal(){try{const s=localStorage.getItem('j416v6');if(s){const p=JSON.parse(s);if(p&&p.cadets&&p.cadets.length)S=p;}}catch(e){}}
 
-let _listening = false;
-function startListening() {
-  if (_listening) return;
-  _listening = true;
-  db.ref('j416/state').on('value', snap => {
-    const p = snap.val();
-    if (p && p.cadets && p.cadets.length) {
-      S = p;
-      // Refresh current view if app is open
-      if (ME) {
-        if (isCmd) {
-          rCal && rCal();
-          if (curKey) loadDay(selD);
-        } else {
-          renderMyWeek && renderMyWeek();
+function startPolling() {
+  clearInterval(_pollTimer);
+  _pollTimer = setInterval(() => {
+    fbGet('/j416/state').then(p => {
+      if (p && p.cadets && p._ts && p._ts !== (S._ts||0)) {
+        S = p;
+        if (ME) {
+          if (isCmd) { rCal && rCal(); if (typeof selD !== 'undefined' && selD) loadDay(selD); }
+          else { renderMyWeek && renderMyWeek(); }
         }
       }
-    }
-  });
+    }).catch(()=>{});
+  }, 5000);
 }
 
 function sv() {
@@ -491,17 +475,21 @@ function sv() {
 
 function svLocal(){try{localStorage.setItem('j416v6',JSON.stringify(S));}catch(e){}}
 
-let _svTimer = null;
 function svRemote() {
   if (!dbReady) return;
   clearTimeout(_svTimer);
   _svTimer = setTimeout(() => {
-    db.ref('j416/state').set(S).catch(e => {
-      console.error('Firebase save error:', e);
+    S._ts = Date.now();
+    fbSet('/j416/state', S).then(() => {
+      console.log('[Firebase] Saved OK');
+    }).catch(e => {
+      console.error('[Firebase] Save error:', e);
       toast('⚠️ Помилка збереження в хмару!');
     });
   }, 500);
 }
+
+function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('on'));document.getElementById(id).classList.add('on');}
 
 // ══════════ LOGIN ══════════
 function checkPw(){
